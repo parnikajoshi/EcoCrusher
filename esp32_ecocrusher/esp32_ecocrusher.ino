@@ -5,7 +5,7 @@
 
 // ================= WIFI =================
 const char* WIFI_SSID     = "Parnika’s iPhone";
-const char* WIFI_PASSWORD = "12345678";
+const char* WIFI_PASSWORD = "********";
 
 // ================= PINS =================
 const int TRIG1 = 5;
