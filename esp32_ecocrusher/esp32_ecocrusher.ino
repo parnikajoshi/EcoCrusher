@@ -4,7 +4,7 @@
 #include <ESPmDNS.h>
 
 // ================= WIFI =================
-const char* WIFI_SSID     = "Parnika’s iPhone";
+const char* WIFI_SSID     = "wifi_ssid";
 const char* WIFI_PASSWORD = "********";
 
 // ================= PINS =================
