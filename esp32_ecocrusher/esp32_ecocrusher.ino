@@ -1,131 +1,338 @@
-#include <ESP32Servo.h>
 #include <WiFi.h>
+#include <ESP32Servo.h>
 #include <WebServer.h>
+#include <ESPmDNS.h>
 
-const char* WIFI_SSID     = "Joshi BSNL FIBER 2.4";
-const char* WIFI_PASSWORD = "@strOidiot4104";
+// ================= WIFI =================
+const char* WIFI_SSID     = "Parnika’s iPhone";
+const char* WIFI_PASSWORD = "12345678";
 
-// Pins
-const int TRIG1 = 5;  const int ECHO1 = 18;
-const int TRIG2 = 21; const int ECHO2 = 19;
+// ================= PINS =================
+const int TRIG1 = 5;
+const int ECHO1 = 18;
+
+const int TRIG2 = 21;
+const int ECHO2 = 19;
+
 const int IR_PIN = 4;
+
 const int LED_PWR = 25;
-const int LED1 = 27;  const int LED2 = 15;
-const int TOUCH_PWR = 13; const int TOUCH_RST = 14;
+const int LED1    = 27;
+const int LED2    = 15;
+
+const int TOUCH_PWR = 13;
+const int TOUCH_RST = 14;
+
 const int SERVO_PIN = 33;
 
+// ================= OBJECTS =================
 Servo myServo;
+WebServer server(80);
 
-// CHANGE: System starts ON
-bool systemOn = true; 
+// ================= VARIABLES =================
+bool systemOn = true;
+
 int objectCount = 0;
-bool lastIRState = HIGH;
-bool servoTriggered = false;
-unsigned long servoStartTime = 0;
 
+bool lastIRState = HIGH;
+
+bool servoActive = false;
+unsigned long servoMoveTime = 0;
+
+const unsigned long SERVO_HOLD = 1000;
+
+// Touch debounce
 unsigned long lastTouchPwrTime = 0;
 unsigned long lastTouchRstTime = 0;
+
 const unsigned long TOUCH_COOLDOWN = 500;
 
-int dist1 = -1; int dist2 = -1;
+// Ultrasonic distances
+int dist1 = -1;
+int dist2 = -1;
+
+// ================= FUNCTION DECLARATIONS =================
+int getDistance(int trig, int echo);
+
+void sendCORS() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "*");
+}
+
+// ================= WEB API =================
+
+void handleStatus() {
+  sendCORS();
+
+  String json = "{";
+  json += "\"count\":" + String(objectCount) + ",";
+  json += "\"systemOn\":" + String(systemOn ? "true" : "false") + ",";
+  json += "\"dist1\":" + String(dist1) + ",";
+  json += "\"dist2\":" + String(dist2) + ",";
+  json += "\"bin1Full\":" + String((dist1 > 0 && dist1 < 15) ? "true" : "false") + ",";
+  json += "\"bin2Full\":" + String((dist2 > 0 && dist2 < 15) ? "true" : "false") + ",";
+  json += "\"servoAngle\":" + String(myServo.read());
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+void handleReset() {
+  sendCORS();
+
+  objectCount = 0;
+
+  Serial.println("COUNT RESET FROM WEB");
+
+  server.send(
+    200,
+    "application/json",
+    "{\"status\":\"ok\",\"count\":0}"
+  );
+}
+
+void handlePower() {
+  sendCORS();
+
+  systemOn = !systemOn;
+
+  digitalWrite(LED_PWR, systemOn ? HIGH : LOW);
+
+  Serial.println(systemOn ? "POWER ON (WEB)" : "POWER OFF (WEB)");
+
+  server.send(
+    200,
+    "application/json",
+    "{\"systemOn\":" + String(systemOn ? "true" : "false") + "}"
+  );
+}
+
+// ================= SETUP =================
 
 void setup() {
-  // Use 115200 - Ensure Serial Monitor matches this!
-  Serial.begin(115200); 
-  delay(500); 
-  Serial.println("\n--- INITIALIZING SYSTEM ---");
 
-  pinMode(TRIG1, OUTPUT); pinMode(ECHO1, INPUT);
-  pinMode(TRIG2, OUTPUT); pinMode(ECHO2, INPUT);
+  Serial.begin(115200);
+
+  delay(1000);
+
+  Serial.println("\n===== BOOTING SYSTEM =====");
+
+  // -------- PWM TIMERS --------
+  // VERY IMPORTANT for WiFi + Servo stability
+
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+
+  // -------- PIN MODES --------
+
+  pinMode(TRIG1, OUTPUT);
+  pinMode(ECHO1, INPUT);
+
+  pinMode(TRIG2, OUTPUT);
+  pinMode(ECHO2, INPUT);
+
   pinMode(IR_PIN, INPUT);
+
   pinMode(LED_PWR, OUTPUT);
-  pinMode(LED1, OUTPUT); pinMode(LED2, OUTPUT);
-  pinMode(TOUCH_PWR, INPUT); pinMode(TOUCH_RST, INPUT);
+  digitalWrite(LED_PWR, HIGH); // Always ON
 
-  // Set initial LED state based on systemOn (TRUE)
-  digitalWrite(LED_PWR, HIGH); 
+  pinMode(LED1, OUTPUT);
+  pinMode(LED2, OUTPUT);
 
-  myServo.attach(SERVO_PIN, 500, 2400);
-  myServo.write(0);
+  // IMPORTANT:
+  // INPUT_PULLDOWN gives stable touch/button readings
+  pinMode(TOUCH_PWR, INPUT_PULLDOWN);
+  pinMode(TOUCH_RST, INPUT_PULLDOWN);
 
-  Serial.println("Connecting WiFi (Check router if this hangs)...");
+  // -------- WIFI --------
+
+  Serial.print("Connecting to WiFi");
+
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  
-  // Non-blocking WiFi check (won't freeze the Serial monitor forever)
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 10) {
+
+  int retry = 0;
+
+  while (WiFi.status() != WL_CONNECTED && retry < 30) {
     delay(500);
     Serial.print(".");
-    attempts++;
+    retry++;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi Connected! IP: " + WiFi.localIP().toString());
+
+    Serial.println("\nWiFi CONNECTED");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+
+    // mDNS
+    if (MDNS.begin("ecocrusher")) {
+      Serial.println("mDNS started");
+      Serial.println("Open: http://ecocrusher.local");
+    }
+
   } else {
-    Serial.println("\nWiFi Timed Out - Operating in Offline Mode.");
+
+    Serial.println("\nWiFi FAILED");
   }
-  
-  Serial.println("SYSTEM STATUS: ON (Ready for Touch Input)");
+
+  // -------- SERVO --------
+
+  myServo.setPeriodHertz(50);
+
+  myServo.attach(SERVO_PIN, 500, 2400);
+
+  myServo.write(0);
+
+  Serial.println("Servo Ready");
+
+  // -------- WEB ROUTES --------
+
+  server.on("/status", HTTP_GET, handleStatus);
+
+  server.on("/reset", HTTP_POST, handleReset);
+
+  server.on("/power", HTTP_POST, handlePower);
+
+  server.on("/status", HTTP_OPTIONS, []() {
+    sendCORS();
+    server.send(204);
+  });
+
+  server.begin();
+
+  Serial.println("Web Server Started");
+
+  Serial.println("===== SYSTEM READY =====");
 }
 
+// ================= LOOP =================
+
 void loop() {
+
+  server.handleClient();
+
   unsigned long now = millis();
 
-  // 1. TOUCH POWER TOGGLE
-  if (digitalRead(TOUCH_PWR) == HIGH && (now - lastTouchPwrTime > TOUCH_COOLDOWN)) {
+  // =========================================
+  // TOUCH POWER BUTTON
+  // =========================================
+
+  if (
+    digitalRead(TOUCH_PWR) == HIGH &&
+    (now - lastTouchPwrTime > TOUCH_COOLDOWN)
+  ) {
+
     systemOn = !systemOn;
-    digitalWrite(LED_PWR, systemOn ? HIGH : LOW);
-    Serial.print("TOUCH DETECTED. SYSTEM IS NOW: ");
-    Serial.println(systemOn ? "ON" : "OFF");
+
+    
+
+    Serial.println(systemOn ? "POWER ON" : "POWER OFF");
+
     lastTouchPwrTime = now;
   }
 
-  // 2. TOUCH RESET
-  if (digitalRead(TOUCH_RST) == HIGH && (now - lastTouchRstTime > TOUCH_COOLDOWN)) {
+  // =========================================
+  // TOUCH RESET BUTTON
+  // =========================================
+
+  if (
+    digitalRead(TOUCH_RST) == HIGH &&
+    (now - lastTouchRstTime > TOUCH_COOLDOWN)
+  ) {
+
     objectCount = 0;
-    Serial.println("RESET DETECTED. COUNT: 0");
+
+    Serial.println("COUNT RESET");
+
     lastTouchRstTime = now;
   }
 
-  // 3. SENSORS (Only if system is ON)
-  if (systemOn) {
-    // Ultrasonic Logic
-    dist1 = getDistance(TRIG1, ECHO1);
-    dist2 = getDistance(TRIG2, ECHO2);
-    
-    digitalWrite(LED1, (dist1 > 0 && dist1 < 15) ? HIGH : LOW);
-    digitalWrite(LED2, (dist2 > 0 && dist2 < 15) ? HIGH : LOW);
+  // =========================================
+  // MAIN SYSTEM
+  // =========================================
 
-    // IR Logic
+  if (systemOn) {
+
+    // -------- ULTRASONIC SENSORS --------
+
+    dist1 = getDistance(TRIG1, ECHO1);
+
+    dist2 = getDistance(TRIG2, ECHO2);
+
+    // LED INDICATIONS
+
+    digitalWrite(
+      LED1,
+      (dist1 > 0 && dist1 < 15) ? HIGH : LOW
+    );
+
+    digitalWrite(
+      LED2,
+      (dist2 > 0 && dist2 < 15) ? HIGH : LOW
+    );
+
+    // -------- IR SENSOR --------
+
     bool curIR = digitalRead(IR_PIN);
-    if (lastIRState == HIGH && curIR == LOW) {
+
+    if (
+      lastIRState == HIGH &&
+      curIR == LOW &&
+      !servoActive
+    ) {
+
       objectCount++;
-      Serial.print("OBJECT DETECTED! NEW COUNT: ");
+
+      Serial.print("OBJECT COUNT: ");
       Serial.println(objectCount);
-      
-      // Servo Action
-      myServo.write(60);
-      servoTriggered = true;
-      servoStartTime = now;
+
+      myServo.write(90);
+
+      servoActive = true;
+
+      servoMoveTime = now;
     }
+
     lastIRState = curIR;
-  } else {
-    // If system is OFF, keep LEDs off
-    digitalWrite(LED1, LOW);
-    digitalWrite(LED2, LOW);
   }
 
-  // 4. SERVO AUTO-RETURN
-  if (servoTriggered && (now - servoStartTime >= 2000)) {
+  // =========================================
+  // SERVO RETURN
+  // =========================================
+
+  if (
+    servoActive &&
+    (now - servoMoveTime >= SERVO_HOLD)
+  ) {
+
     myServo.write(0);
-    servoTriggered = false;
+
+    servoActive = false;
   }
 }
 
+// ================= ULTRASONIC FUNCTION =================
+
 int getDistance(int trig, int echo) {
-  digitalWrite(trig, LOW); delayMicroseconds(2);
-  digitalWrite(trig, HIGH); delayMicroseconds(10);
+
   digitalWrite(trig, LOW);
-  long dur = pulseIn(echo, HIGH, 25000);
-  return (dur == 0) ? -1 : (int)(dur * 0.034 / 2);
+  delayMicroseconds(2);
+
+  digitalWrite(trig, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(trig, LOW);
+
+  long duration = pulseIn(echo, HIGH, 25000);
+
+  if (duration == 0) {
+    return -1;
+  }
+
+  int distance = duration * 0.034 / 2;
+
+  return distance;
 }
